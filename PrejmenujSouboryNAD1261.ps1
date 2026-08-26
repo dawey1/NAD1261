@@ -1,136 +1,136 @@
 param(
     [string]$Root = "c:\NAD1261_008",
-    [switch]$WhatIf
+    [ValidateSet("Check", "Rename", "Test")]
+    [string]$Mode = "Check",
+    [string]$DestinationRoot,
+    [string]$LogDirectory = (Join-Path $PSScriptRoot "logs")
 )
 
 $ErrorActionPreference = "Stop"
 
-function Get-AjFolders {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    Get-ChildItem -LiteralPath $Path -Directory -Recurse -Force -ErrorAction Stop |
-        Where-Object { $_.Name -match '^aj(\d+[a-z]?)$' } |
-        Sort-Object FullName
+function Write-EventLog {
+    param([string]$Path, [hashtable]$Event)
+    $Event.timestamp = (Get-Date).ToString("o")
+    $Event | ConvertTo-Json -Compress -Depth 8 | Add-Content -LiteralPath $Path -Encoding UTF8
 }
 
-function Get-FileGroupKey {
-    param([Parameter(Mandatory = $true)][string]$BaseName)
-
-    if ($BaseName -match '^(.*\d)[a-z]+$') {
-        return $Matches[1].ToLowerInvariant()
-    }
-
-    return $BaseName.ToLowerInvariant()
+function Write-State {
+    param([hashtable]$State)
+    $State.timestamp = (Get-Date).ToString("o")
+    $temporary = "$script:StatePath.tmp"
+    $State | ConvertTo-Json -Compress -Depth 12 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $script:StatePath -Force
 }
 
-function Get-SourceNumber {
-    param([Parameter(Mandatory = $true)][string]$BaseName)
+function Add-Failure {
+    param([string]$Operation, [string]$Path, [System.Exception]$Exception)
+    Write-EventLog $script:ChangesLog @{ level = "ERROR"; operation = $Operation; path = $Path; message = $Exception.Message }
+}
 
-    if ($BaseName -match '(\d+)[a-z]*$') {
-        return [int]$Matches[1]
+function Get-NormalizedAjCode {
+    param([string]$Name)
+    if ($Name -notmatch '^aj(\d+)([a-z]?)$') { throw "Neplatny nazev adresare aj: $Name" }
+    return ("{0:D3}{1}" -f [int]$Matches[1], $Matches[2].ToLowerInvariant())
+}
+
+function Get-SourceFolderInfo {
+    param([System.IO.DirectoryInfo]$Folder)
+    if ($Folder.Name -match '^b(\d+)([a-z]?)(?:-(\d+))?$') {
+        return [PSCustomObject]@{ Type = "b"; Code = ("{0:D2}{1}" -f [int]$Matches[1], $Matches[2].ToLowerInvariant()); Folder = $Folder }
     }
-
+    if ($Folder.Name -match '^inf(\d+)$') {
+        return [PSCustomObject]@{ Type = "inf"; Code = ("{0:D2}" -f [int]$Matches[1]); Folder = $Folder }
+    }
     return $null
 }
 
-if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
-    throw "Zadana cesta neexistuje: $Root"
+function Get-ScanParts {
+    param([string]$BaseName)
+    if ($BaseName -notmatch '^(.*?)(\d+)([a-z]*)$') { return $null }
+    return [PSCustomObject]@{
+        GroupKey = $BaseName.Substring(0, $BaseName.Length - $Matches[2].Length - $Matches[3].Length).ToLowerInvariant() + $Matches[2]
+        Variant = $Matches[3].ToLowerInvariant()
+    }
 }
 
-$ajFolders = @(Get-AjFolders -Path $Root)
-
-if ($ajFolders.Count -eq 0) {
-    Write-Host "Nenalezeny zadne slozky aj s ciselkem."
-    exit 0
+function Get-TargetName {
+    param([string]$AjCode, [PSCustomObject]$FolderInfo, [int]$Number, [string]$Variant)
+    if ($FolderInfo.Type -eq "inf") { return "NAD1261_008_{0}_inf_{1}_{2:D4}{3}.jpg" -f $AjCode, $FolderInfo.Code, $Number, $Variant }
+    return "NAD1261_008_{0}_{1}_{2:D4}{3}.jpg" -f $AjCode, $FolderInfo.Code, $Number, $Variant
 }
 
-$operations = @()
+if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw "Zadana cesta neexistuje: $Root" }
+if ($Mode -eq "Test" -and [string]::IsNullOrWhiteSpace($DestinationRoot)) {
+    $DestinationRoot = Join-Path (Split-Path -Parent $Root) ("{0}_test" -f (Split-Path -Leaf $Root))
+}
+if ($Mode -eq "Test" -and [IO.Path]::GetFullPath($DestinationRoot).TrimEnd("\") -eq [IO.Path]::GetFullPath($Root).TrimEnd("\")) { throw "Testovaci cil musi byt odlisny od zdroje." }
 
+$null = New-Item -Path $LogDirectory -ItemType Directory -Force
+$script:ChangesLog = Join-Path $LogDirectory "rename_changes.log"
+$script:IgnoredLog = Join-Path $LogDirectory "ignored_files.log"
+$script:StatePath = Join-Path $LogDirectory "rename_state.log"
+$state = @{ mode = $Mode; root = $Root; completed = @{}; groupNumbers = @{}; status = "RUNNING" }
+
+if ($Mode -ne "Check" -and (Test-Path -LiteralPath $StatePath)) {
+    try { $saved = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { Add-Failure "load-state" $StatePath $_.Exception; $saved = $null }
+    if ($null -ne $saved -and $saved.root -eq $Root -and $saved.mode -eq $Mode) {
+        foreach ($property in $saved.completed.PSObject.Properties) { $state.completed[$property.Name] = $property.Value }
+        foreach ($property in $saved.groupNumbers.PSObject.Properties) { $state.groupNumbers[$property.Name] = [int]$property.Value }
+    }
+}
+
+$ajFolders = @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction Stop | Where-Object { $_.Name -match '^aj\d+[a-z]?$' } | Sort-Object Name)
 foreach ($aj in $ajFolders) {
-    $ajMatch = [regex]::Match($aj.Name, '^aj(\d+[a-z]?)$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    $ajCode = $ajMatch.Groups[1].Value
+    try {
+        $ajCode = Get-NormalizedAjCode $aj.Name
+        $sourceFolders = @(Get-ChildItem -LiteralPath $aj.FullName -Directory -Force -ErrorAction Stop | ForEach-Object { Get-SourceFolderInfo $_ } | Where-Object { $null -ne $_ } | Sort-Object { $_.Folder.Name })
+        foreach ($folderInfo in $sourceFolders) {
+            $sourceFolder = $folderInfo.Folder
+            $sourceFolderPath = $sourceFolder.FullName
+            $normalizedName = $sourceFolder.Name -replace '-\d+$', ''
+            $isRange = $folderInfo.Type -eq "b" -and $sourceFolder.Name -ne $normalizedName
+            $destinationFolder = $sourceFolderPath
 
-    $pointFolders = @(Get-ChildItem -LiteralPath $aj.FullName -Directory -Force -ErrorAction Stop |
-        Where-Object { $_.Name -match '^b\d+$' } |
-        Sort-Object Name)
+            if ($isRange -and $Mode -eq "Rename") {
+                $destinationFolder = Join-Path $sourceFolder.Parent.FullName $normalizedName
+                if (Test-Path -LiteralPath $destinationFolder) { Add-Failure "rename-folder-collision" $sourceFolderPath ([Exception]::new("Cilova slozka existuje: $destinationFolder")); continue }
+                Rename-Item -LiteralPath $sourceFolderPath -NewName $normalizedName
+                Write-EventLog $script:ChangesLog @{ level = "INFO"; operation = "rename-folder"; source = $sourceFolderPath; destination = $destinationFolder }
+                $sourceFolderPath = $destinationFolder
+            } elseif ($isRange -and $Mode -eq "Test") { $destinationFolder = Join-Path (Join-Path $DestinationRoot $aj.Name) $normalizedName }
+            elseif ($Mode -eq "Test") { $destinationFolder = Join-Path (Join-Path $DestinationRoot $aj.Name) $sourceFolder.Name }
 
-    foreach ($point in $pointFolders) {
-        $pointMatch = [regex]::Match($point.Name, '^b(\d+)$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        $pointCode = ([int]$pointMatch.Groups[1].Value).ToString('D2')
-        $allFiles = @(Get-ChildItem -LiteralPath $point.FullName -File -Force -ErrorAction Stop |
-            Sort-Object Name)
-        $processedFiles = @($allFiles | Where-Object {
-            $_.Name -match '^NAD1261_008_\d+_\d+_\d{4}[a-z]*\.[^.]+$'
-        })
-        $files = @($allFiles | Where-Object {
-            $_.Name -notmatch '^NAD1261_008_\d+_\d+_\d{4}[a-z]*\.[^.]+$'
-        })
-
-        $sequence = 1
-        $groupNumbers = @{}
-        $usedNumbers = @{}
-        foreach ($processedFile in $processedFiles) {
-            if ($processedFile.Name -match '^NAD1261_008_\d+_\d+_(\d{4})[a-z]*\.') {
-                $usedNumbers[[int]$Matches[1]] = $true
-            }
-        }
-
-        foreach ($file in $files) {
-            $groupKey = Get-FileGroupKey -BaseName $file.BaseName
-            if (-not $groupNumbers.ContainsKey($groupKey)) {
-                $sourceNumber = Get-SourceNumber -BaseName $groupKey
-                if ($null -ne $sourceNumber -and $usedNumbers.ContainsKey($sourceNumber)) {
-                    $groupNumbers[$groupKey] = $sourceNumber
-                } else {
-                    while ($usedNumbers.ContainsKey($sequence)) {
-                        $sequence++
-                    }
-                    $groupNumbers[$groupKey] = $sequence
-                    $usedNumbers[$sequence] = $true
-                    $sequence++
+            if ($Mode -eq "Test" -and -not (Test-Path -LiteralPath $destinationFolder)) { $null = New-Item -Path $destinationFolder -ItemType Directory -Force; Write-EventLog $script:ChangesLog @{ level = "INFO"; operation = "create-folder"; source = $sourceFolderPath; destination = $destinationFolder } }
+            $files = @(Get-ChildItem -LiteralPath $sourceFolderPath -File -Force -ErrorAction Stop | Sort-Object Name)
+            foreach ($file in $files | Where-Object { $_.Extension -cne ".jpg" }) { Write-EventLog $script:IgnoredLog @{ level = "IGNORED"; path = $file.FullName; reason = "Pripona neni .jpg" } }
+            foreach ($file in @($files | Where-Object { $_.Extension -ceq ".jpg" })) {
+                $parts = Get-ScanParts $file.BaseName
+                if ($null -eq $parts) { Write-EventLog $script:IgnoredLog @{ level = "IGNORED"; path = $file.FullName; reason = "Nazev neobsahuje cislo skenu" }; continue }
+                $key = "$sourceFolderPath|$($parts.GroupKey)"
+                if (-not $state.groupNumbers.ContainsKey($key)) {
+                    $next = 1
+                    $folderPrefix = "$sourceFolderPath|"
+                    $usedNumbers = @($state.groupNumbers.GetEnumerator() | Where-Object { $_.Key.StartsWith($folderPrefix) } | ForEach-Object { [int]$_.Value })
+                    while ($usedNumbers -contains $next) { $next++ }
+                    $state.groupNumbers[$key] = $next
                 }
-            }
-
-            $variant = ""
-            if ($file.BaseName -match '\d([a-z]+)$') {
-                $variant = $Matches[1].ToLowerInvariant()
-            }
-
-            $extension = $file.Extension.ToLowerInvariant()
-            $newName = "NAD1261_008_{0}_{1}_{2:D4}{3}{4}" -f $ajCode, $pointCode, $groupNumbers[$groupKey], $variant, $extension
-            $operations += [PSCustomObject]@{
-                Source = $file.FullName
-                Destination = Join-Path $point.FullName $newName
-                NewName = $newName
+                $targetName = Get-TargetName $ajCode $folderInfo $state.groupNumbers[$key] $parts.Variant
+                $targetPath = Join-Path $destinationFolder $targetName
+                $operationKey = "$($file.FullName)|$targetPath"
+                if ($state.completed.ContainsKey($operationKey)) { continue }
+                if ($Mode -eq "Check") { Write-EventLog $script:ChangesLog @{ level = "PLAN"; operation = "rename-file"; source = $file.FullName; destination = $targetPath }; continue }
+                if (Test-Path -LiteralPath $targetPath) { Add-Failure "destination-collision" $targetPath ([Exception]::new("Cilovy soubor existuje.")); continue }
+                try {
+                    if ($Mode -eq "Rename") { Rename-Item -LiteralPath $file.FullName -NewName $targetName } else { $null = New-Item -Path $targetPath -ItemType File -Force }
+                    $state.completed[$operationKey] = $true
+                    Write-EventLog $script:ChangesLog @{ level = "INFO"; operation = $(if ($Mode -eq "Rename") { "rename-file" } else { "create-file" }); source = $file.FullName; destination = $targetPath }
+                    Write-State $state
+                } catch { Add-Failure $(if ($Mode -eq "Rename") { "rename-file" } else { "create-file" }) $file.FullName $_.Exception; Write-State $state }
             }
         }
-    }
+    } catch { Add-Failure "scan-aj" $aj.FullName $_.Exception }
 }
 
-$duplicateDestinations = @($operations | Group-Object Destination | Where-Object Count -gt 1)
-if ($duplicateDestinations.Count -gt 0) {
-    throw "Byly vytvoreny duplicitni cilove nazvy souboru."
-}
-
-Write-Host "Nalezeno souboru: $($operations.Count)"
-
-foreach ($operation in $operations) {
-    if ($operation.Source -ieq $operation.Destination) {
-        continue
-    }
-
-    if (Test-Path -LiteralPath $operation.Destination) {
-        throw "Cilovy soubor jiz existuje: $($operation.Destination)"
-    }
-
-    Write-Host "$($operation.Source) -> $($operation.NewName)"
-    if (-not $WhatIf) {
-        Rename-Item -LiteralPath $operation.Source -NewName $operation.NewName
-    }
-}
-
-if ($WhatIf) {
-    Write-Host "Nahled dokoncen. Soubory nebyly prejmenovany."
-} else {
-    Write-Host "Prejmenovani dokonceno."
-}
+$state.status = "COMPLETED"
+Write-State $state
+Write-Host "Rezim $Mode dokoncen. Logy: $LogDirectory"
