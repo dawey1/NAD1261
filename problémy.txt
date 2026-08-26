@@ -1,0 +1,12 @@
+\\fsch01\Prijem\NAD1261\NAD1261_008\Ka004\aj005\b008\
+
+NAD1261_0_11_Ka004_aj005_b008-fol002.jpg
+a
+NAD1261_0_11_Ka004_aj005_b008-fol002a.jpg
+
+
+
+body 0 zaèínají skeny od 0 
+ostatní body zaèínají od 1
+
+

@@ -1,0 +1,3 @@
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\PresunB000DoZalohy.ps1 -Root "\\fsch01\Prijem\NAD1261\NAD1261_008"
