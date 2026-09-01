@@ -19,7 +19,7 @@ if (-not (Test-Path $outRoot)) {
 }
 
 $kaList = Get-ChildItem $root -Directory |
-Where-Object { $_.Name -match '^Ka\d+$' } |
+Where-Object { $_.Name -match '^Ka\d+.*$' } |
 Sort-Object Name |
 Where-Object {
     [int]($_.Name.Substring(2)) -ge $startKa
